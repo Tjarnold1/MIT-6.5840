@@ -593,7 +593,7 @@ func TestBackup3B(t *testing.T) {
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
-		ts.one(rand.Int(), 3, true)
+		ts.one(fmt.Sprintf("b%d", rand.Int()), 3, true)
 	}
 
 	// now everyone
