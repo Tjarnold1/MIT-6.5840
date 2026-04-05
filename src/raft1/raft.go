@@ -27,6 +27,8 @@ const (
 	StatusCandidate Status = "candidate"
 )
 
+const grpcTimeout time.Duration = time.Duration(50) * time.Millisecond
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -149,16 +151,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
+	//defer rf.persist()
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		return
 	}
-	if args.Term >= rf.currentTerm {
+	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.votedFor = &args.CandidateId
 		rf.status = StatusFollower
-		rf.votedFor = nil
 		rf.votesAcquired = 0
 		reply.Term = rf.currentTerm
 	}
@@ -189,28 +191,28 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
+	//defer rf.persist()
 	// Check if this leader is for the most up-to-date term
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
 	}
-	// Check if this peer needs its term updated
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.status = StatusFollower
-		rf.votedFor = nil
-		rf.votesAcquired = 0
-		rf.nextIndex = make([]int, len(rf.peers))
-		rf.matchIndex = make([]int, len(rf.peers))
-	}
-	// We now know we have a legitimate leader. Send election timeout event
+	// Send election timeout
 	select {
 	case rf.electionTimeoutCh <- struct{}{}:
 		// Election timeout sent
 	default:
 		// Channel was already full
+	}
+	// Check if this peer needs its term updated
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.status = StatusFollower
+		rf.votedFor = &args.LeaderId
+		rf.votesAcquired = 0
+		rf.nextIndex = make([]int, len(rf.peers))
+		rf.matchIndex = make([]int, len(rf.peers))
 	}
 	// Is there an entry at the provided index
 	if args.PrevLogIndex >= len(rf.log) {
@@ -311,7 +313,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) startAppendRequest(peer int, args *AppendEntriesArgs) {
 	resp := &AppendEntriesReply{}
-	ok := rf.peers[peer].Call("Raft.AppendEntries", args, resp)
+	ok := rf.grpcWithRetry("Raft.AppendEntries", peer, args, resp, 3)
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
@@ -387,19 +389,32 @@ func (rf *Raft) beginElection() {
 	}
 }
 
+func (rf *Raft) grpcWithRetry(method string, server int, args interface{}, reply interface{}, tryCount int) bool {
+	c := make(chan bool, 1)
+	for i := 0; i < tryCount; i++ {
+		go func() {
+			c <- rf.peers[server].Call(method, args, reply)
+		}()
+		select {
+		case <-c:
+			return true
+		case <-time.After(grpcTimeout):
+			// Try again
+		}
+	}
+	return false
+}
+
 func (rf *Raft) requestVote(server int, args *RequestVoteArgs) {
 	reply := &RequestVoteReply{}
-	ok := false
-	for i := 0; i < 3 && !ok; i++ {
-		ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
-		if !ok {
-			time.Sleep(100 * time.Millisecond)
-		}
+	ok := rf.grpcWithRetry("Raft.RequestVote", server, args, &reply, 3)
+	if !ok {
+		return
 	}
 	// Has the state changed in a way that means we don't need to process this
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.status != StatusCandidate || !ok {
+	if rf.status != StatusCandidate {
 		return
 	}
 	if reply.Term != rf.currentTerm {
@@ -496,7 +511,9 @@ func (rf *Raft) updateCommitIndex() {
 			greaterThanCommit++
 		}
 	}
-	if greaterThanCommit > len(rf.peers)/2 && rf.status == StatusLeader {
+	if greaterThanCommit > len(rf.peers)/2 &&
+		rf.status == StatusLeader &&
+		rf.commitIndex+1 < len(rf.log) {
 		rf.commitIndex++
 	}
 	return
