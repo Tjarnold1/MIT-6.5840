@@ -7,12 +7,14 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
+	"bytes"
 	//	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"6.5840/labgob"
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
@@ -90,6 +92,17 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	if rf.votedFor == nil {
+		e.Encode(-1)
+	} else {
+		e.Encode(&rf.votedFor)
+	}
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -110,6 +123,27 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if err := d.Decode(&currentTerm); err != nil {
+		panic("error decoding current term")
+	}
+	if err := d.Decode(&votedFor); err != nil {
+		panic("error decoding voted for")
+	}
+	if err := d.Decode(&log); err != nil {
+		panic("error decoding log")
+	}
+	rf.currentTerm = currentTerm
+	if votedFor == -1 {
+		rf.votedFor = nil
+	} else {
+		rf.votedFor = &votedFor
+	}
+	rf.log = log
 }
 
 // how many bytes in Raft's persisted log?
@@ -151,7 +185,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//defer rf.persist()
+	defer rf.persist()
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
@@ -191,7 +225,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//defer rf.persist()
+	defer rf.persist()
 	// Check if this leader is for the most up-to-date term
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -418,6 +452,7 @@ func (rf *Raft) requestVote(server int, args *RequestVoteArgs) {
 		return
 	}
 	if reply.Term != rf.currentTerm {
+		defer rf.persist()
 		rf.currentTerm = reply.Term
 		rf.status = StatusFollower
 		rf.votesAcquired = 0
