@@ -8,6 +8,8 @@ package raft
 
 import (
 	"bytes"
+	"slices"
+
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -30,7 +32,7 @@ const (
 	NoVote          int    = -1
 )
 
-const grpcTimeout time.Duration = time.Duration(50) * time.Millisecond
+const grpcTimeout time.Duration = time.Duration(1000) * time.Millisecond
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -329,7 +331,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			LeaderId:     rf.me,
 			PrevLogIndex: rf.nextIndex[i] - 1,
 			PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
-			Entries:      rf.log[rf.nextIndex[i]:],
+			Entries:      slices.Clone(rf.log[rf.nextIndex[i]:]),
 			CommitIndex:  rf.commitIndex,
 		}
 		go rf.startAppendRequest(i, args)
@@ -340,7 +342,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) startAppendRequest(peer int, args *AppendEntriesArgs) {
 	resp := &AppendEntriesReply{}
-	ok := rf.grpcWithRetry("Raft.AppendEntries", peer, args, resp, 3)
+	ok := rf.grpcWithRetry("Raft.AppendEntries", peer, args, resp, 1)
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
@@ -434,7 +436,7 @@ func (rf *Raft) grpcWithRetry(method string, server int, args interface{}, reply
 
 func (rf *Raft) requestVote(server int, args *RequestVoteArgs) {
 	reply := &RequestVoteReply{}
-	ok := rf.grpcWithRetry("Raft.RequestVote", server, args, &reply, 3)
+	ok := rf.grpcWithRetry("Raft.RequestVote", server, args, &reply, 1)
 	if !ok {
 		return
 	}
@@ -484,7 +486,7 @@ func (rf *Raft) heartbeat() {
 				LeaderId:     rf.me,
 				PrevLogIndex: rf.nextIndex[i] - 1,
 				PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
-				Entries:      rf.log[rf.nextIndex[i]:],
+				Entries:      slices.Clone(rf.log[rf.nextIndex[i]:]),
 				CommitIndex:  rf.commitIndex,
 			}
 			go func(peer int, args *AppendEntriesArgs) {
