@@ -27,6 +27,7 @@ const (
 	StatusFollower  Status = "follower"
 	StatusLeader    Status = "leader"
 	StatusCandidate Status = "candidate"
+	NoVote          int    = -1
 )
 
 const grpcTimeout time.Duration = time.Duration(50) * time.Millisecond
@@ -45,7 +46,7 @@ type Raft struct {
 
 	// Persistent state
 	currentTerm int
-	votedFor    *int
+	votedFor    int
 	log         []LogEntry
 
 	// Volatile state
@@ -95,11 +96,7 @@ func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
-	if rf.votedFor == nil {
-		e.Encode(-1)
-	} else {
-		e.Encode(&rf.votedFor)
-	}
+	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, nil)
@@ -138,11 +135,7 @@ func (rf *Raft) readPersist(data []byte) {
 		panic("error decoding log")
 	}
 	rf.currentTerm = currentTerm
-	if votedFor == -1 {
-		rf.votedFor = nil
-	} else {
-		rf.votedFor = &votedFor
-	}
+	rf.votedFor = votedFor
 	rf.log = log
 }
 
@@ -193,18 +186,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.votedFor = &args.CandidateId
+		rf.votedFor = args.CandidateId
 		rf.status = StatusFollower
 		rf.votesAcquired = 0
 		reply.Term = rf.currentTerm
 	}
 	upToDateLog := rf.log[len(rf.log)-1].Term < args.LastLogTerm ||
-		(args.LastLogIndex == len(rf.log)-1 && rf.log[args.LastLogIndex].Term == args.LastLogTerm)
-	if (rf.votedFor == nil ||
-		*rf.votedFor == args.CandidateId) &&
+		(args.LastLogIndex >= len(rf.log)-1 && rf.log[len(rf.log)-1].Term == args.LastLogTerm)
+	if (rf.votedFor == -1 ||
+		rf.votedFor == args.CandidateId) &&
 		upToDateLog {
 		reply.VoteGranted = true
-		rf.votedFor = &args.CandidateId
+		rf.votedFor = args.CandidateId
 	}
 }
 
@@ -243,7 +236,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.status = StatusFollower
-		rf.votedFor = &args.LeaderId
+		rf.votedFor = args.LeaderId
 		rf.votesAcquired = 0
 		rf.nextIndex = make([]int, len(rf.peers))
 		rf.matchIndex = make([]int, len(rf.peers))
@@ -406,7 +399,7 @@ func (rf *Raft) beginElection() {
 	rf.currentTerm++
 	rf.status = StatusCandidate
 	rf.electionTimeoutCh <- struct{}{} // Reset election timer
-	rf.votedFor = &rf.me
+	rf.votedFor = rf.me
 	rf.votesAcquired = 1
 	req := &RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -456,7 +449,7 @@ func (rf *Raft) requestVote(server int, args *RequestVoteArgs) {
 		rf.currentTerm = reply.Term
 		rf.status = StatusFollower
 		rf.votesAcquired = 0
-		rf.votedFor = nil
+		rf.votedFor = NoVote
 		return
 	}
 	if reply.VoteGranted && reply.Term == rf.currentTerm {
@@ -510,7 +503,7 @@ func (rf *Raft) heartbeat() {
 				if resp.Term > rf.currentTerm {
 					rf.currentTerm = resp.Term
 					rf.status = StatusFollower
-					rf.votedFor = nil
+					rf.votedFor = NoVote
 					rf.votesAcquired = 0
 					rf.nextIndex = make([]int, len(rf.peers))
 					rf.matchIndex = make([]int, len(rf.peers))
@@ -591,6 +584,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.votedFor = NoVote
 	rf.electionTimeoutCh = make(chan struct{}, 1)
 	rf.electionTimeoutCh <- struct{}{}
 
