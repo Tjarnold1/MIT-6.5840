@@ -216,8 +216,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term        int
+	Success     bool
+	BackupIndex int
+	BackupTerm  int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -249,11 +251,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Is there an entry at the provided index
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
+		reply.BackupIndex = len(rf.log) - 1
 		return
 	}
 	// Is the term the same at the index
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		rf.log = rf.log[:args.PrevLogIndex+1]
+		termToSkip := rf.log[args.PrevLogIndex].Term
+		var ind int
+		for ind = args.PrevLogIndex; ind > 0; ind-- {
+			if rf.log[ind].Term != termToSkip {
+				reply.BackupIndex = ind
+				reply.BackupTerm = rf.log[reply.BackupIndex].Term
+				break
+			}
+		}
+		rf.log = rf.log[:ind+1]
 		reply.Success = false
 		return
 	}
@@ -517,7 +529,11 @@ func (rf *Raft) heartbeat() {
 				// According to this peer, we're still leader
 				// Is this peers log aligned with ours?
 				if !resp.Success {
-					rf.nextIndex[peer]--
+					if resp.BackupIndex > 1 {
+						rf.nextIndex[peer] = resp.BackupIndex
+					} else {
+						rf.nextIndex[peer] = 1
+					}
 					return
 				}
 				// Update peer information
