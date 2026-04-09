@@ -335,6 +335,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	entry := LogEntry{Term: rf.currentTerm, Command: command}
 	rf.log = append(rf.log, entry)
+	defer rf.persist()
 	rf.matchIndex[rf.me]++
 	rf.nextIndex[rf.me]++
 	for i, _ := range rf.peers {
@@ -413,6 +414,8 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) beginElection() {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
 	rf.currentTerm++
 	rf.status = StatusCandidate
 	rf.electionTimeoutCh <- struct{}{} // Reset election timer
@@ -424,7 +427,6 @@ func (rf *Raft) beginElection() {
 		LastLogIndex: len(rf.log) - 1,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
-	rf.mu.Unlock()
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -518,6 +520,7 @@ func (rf *Raft) heartbeat() {
 				}
 				// We do. Is there reason to think we aren't?
 				if resp.Term > rf.currentTerm {
+					defer rf.persist()
 					rf.currentTerm = resp.Term
 					rf.status = StatusFollower
 					rf.votedFor = NoVote
@@ -608,6 +611,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.currentTerm = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
