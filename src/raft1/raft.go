@@ -195,11 +195,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	upToDateLog := rf.log[len(rf.log)-1].Term < args.LastLogTerm ||
 		(args.LastLogIndex >= len(rf.log)-1 && rf.log[len(rf.log)-1].Term == args.LastLogTerm)
-	if (rf.votedFor == -1 ||
+	if (rf.votedFor == NoVote ||
 		rf.votedFor == args.CandidateId) &&
 		upToDateLog {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+	} else {
+		rf.votedFor = NoVote
+		reply.VoteGranted = false
 	}
 }
 
@@ -446,7 +449,7 @@ func (rf *Raft) requestVote(server int, args *RequestVoteArgs) {
 	if rf.status != StatusCandidate {
 		return
 	}
-	if reply.Term != rf.currentTerm {
+	if reply.Term > rf.currentTerm {
 		defer rf.persist()
 		rf.currentTerm = reply.Term
 		rf.status = StatusFollower
@@ -454,10 +457,10 @@ func (rf *Raft) requestVote(server int, args *RequestVoteArgs) {
 		rf.votedFor = NoVote
 		return
 	}
-	if reply.VoteGranted && reply.Term == rf.currentTerm {
+	if reply.VoteGranted {
 		rf.votesAcquired++
 	}
-	if rf.votesAcquired >= len(rf.peers)/2+1 {
+	if rf.votesAcquired >= len(rf.peers)/2+1 && rf.status == StatusCandidate {
 		rf.status = StatusLeader
 		rf.nextIndex = make([]int, len(rf.peers))
 		rf.matchIndex = make([]int, len(rf.peers))
