@@ -138,7 +138,7 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
-	rf.log = log
+	rf.log = slices.Clone(log)
 }
 
 // how many bytes in Raft's persisted log?
