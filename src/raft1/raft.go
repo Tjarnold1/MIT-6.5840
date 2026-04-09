@@ -583,7 +583,6 @@ func (rf *Raft) updateCommitIndex() {
 	for {
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
-				yup
 				continue
 			}
 			if rf.matchIndex[i] > rf.commitIndex {
