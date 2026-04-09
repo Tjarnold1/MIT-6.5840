@@ -533,18 +533,24 @@ func (rf *Raft) updateCommitIndex() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	greaterThanCommit := 1 // Set at one because we know that we have the log
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
+	for {
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				yup
+				continue
+			}
+			if rf.matchIndex[i] > rf.commitIndex {
+				greaterThanCommit++
+			}
 		}
-		if rf.matchIndex[i] > rf.commitIndex {
-			greaterThanCommit++
+		if greaterThanCommit > len(rf.peers)/2 &&
+			rf.status == StatusLeader &&
+			rf.commitIndex+1 < len(rf.log) {
+			rf.commitIndex++
+			greaterThanCommit = 1
+		} else {
+			break
 		}
-	}
-	if greaterThanCommit > len(rf.peers)/2 &&
-		rf.status == StatusLeader &&
-		rf.commitIndex+1 < len(rf.log) {
-		rf.commitIndex++
 	}
 	return
 }
