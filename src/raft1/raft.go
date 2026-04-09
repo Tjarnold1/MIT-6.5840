@@ -362,10 +362,35 @@ func (rf *Raft) startAppendRequest(peer int, args *AppendEntriesArgs) {
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		if resp.Success && rf.status == StatusLeader {
-			rf.matchIndex[peer] = len(args.Entries) + args.PrevLogIndex
-			rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+		// Do we still think we're the leader?
+		if rf.status != StatusLeader {
+			return
 		}
+		// We do. Is there reason to think we aren't?
+		if resp.Term > rf.currentTerm {
+			defer rf.persist()
+			rf.currentTerm = resp.Term
+			rf.status = StatusFollower
+			rf.votedFor = NoVote
+			rf.votesAcquired = 0
+			rf.nextIndex = make([]int, len(rf.peers))
+			rf.matchIndex = make([]int, len(rf.peers))
+			return
+		}
+		// According to this peer, we're still leader
+		// Is this peers log aligned with ours?
+		if !resp.Success {
+			if resp.BackupIndex > 1 {
+				rf.nextIndex[peer] = resp.BackupIndex
+			} else {
+				rf.nextIndex[peer] = 1
+			}
+			return
+		}
+		// Update peer information
+		rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+		go rf.updateCommitIndex()
 	}
 }
 
