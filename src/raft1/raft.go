@@ -180,15 +180,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		return
 	}
+	defer rf.persist()
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateId
+		rf.votedFor = NoVote
 		rf.status = StatusFollower
 		rf.votesAcquired = 0
 		reply.Term = rf.currentTerm
@@ -225,9 +225,8 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist()
-	// Check if this leader is for the most up-to-date term
 	reply.Term = rf.currentTerm
+	// Check if this leader is for the most up-to-date term
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
@@ -240,7 +239,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Channel was already full
 	}
 	// Check if this peer needs its term updated
-	if args.Term > rf.currentTerm {
+	if args.Term >= rf.currentTerm {
+		defer rf.persist()
 		rf.currentTerm = args.Term
 		rf.status = StatusFollower
 		rf.votedFor = args.LeaderId
@@ -254,25 +254,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.BackupIndex = len(rf.log) - 1
 		return
 	}
-	// Is the term the same at the index
+	// Matching term on PrevLogIndex?
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		termToSkip := rf.log[args.PrevLogIndex].Term
 		var ind int
-		for ind = args.PrevLogIndex; ind > 0; ind-- {
-			if rf.log[ind].Term != termToSkip {
-				reply.BackupIndex = ind
-				reply.BackupTerm = rf.log[reply.BackupIndex].Term
+		for ind = args.PrevLogIndex; ind > 0 && ind > rf.commitIndex; ind-- {
+			if rf.log[ind].Term < args.PrevLogTerm && rf.log[ind].Term < rf.log[args.PrevLogIndex].Term {
+				reply.BackupIndex = ind + 1
 				break
 			}
 		}
-		rf.log = rf.log[:ind+1]
+		reply.BackupTerm = rf.log[min(reply.BackupIndex, args.PrevLogTerm)].Term
 		reply.Success = false
 		return
 	}
-	// All checks passed. Append the logs...
-	rf.log = rf.log[:args.PrevLogIndex+1]
-	rf.log = append(rf.log, args.Entries...)
+	// All checks passed. Append logs
+	defer rf.persist()
+	var conflictInd int
+	for conflictInd < len(args.Entries) &&
+		conflictInd+args.PrevLogIndex+1 < len(rf.log) &&
+		rf.log[args.PrevLogIndex+conflictInd].Command == args.Entries[conflictInd].Command {
+		conflictInd++
+	}
+	rf.log = rf.log[:(args.PrevLogIndex+1)+conflictInd]
+	rf.log = append(rf.log, args.Entries[conflictInd:]...)
 	reply.Success = true
+	reply.BackupIndex = len(rf.log)
 	if args.CommitIndex > rf.commitIndex {
 		rf.commitIndex = min(args.CommitIndex, len(rf.log)-1)
 	}
@@ -362,34 +368,7 @@ func (rf *Raft) startAppendRequest(peer int, args *AppendEntriesArgs) {
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		// Do we still think we're the leader?
-		if rf.status != StatusLeader {
-			return
-		}
-		// We do. Is there reason to think we aren't?
-		if resp.Term > rf.currentTerm {
-			defer rf.persist()
-			rf.currentTerm = resp.Term
-			rf.status = StatusFollower
-			rf.votedFor = NoVote
-			rf.votesAcquired = 0
-			rf.nextIndex = make([]int, len(rf.peers))
-			rf.matchIndex = make([]int, len(rf.peers))
-			return
-		}
-		// According to this peer, we're still leader
-		// Is this peers log aligned with ours?
-		if !resp.Success {
-			if resp.BackupIndex > 1 {
-				rf.nextIndex[peer] = resp.BackupIndex
-			} else {
-				rf.nextIndex[peer] = 1
-			}
-			return
-		}
-		// Update peer information
-		rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
-		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+		rf.digestAppendReponse(peer, resp)
 		go rf.updateCommitIndex()
 	}
 }
@@ -511,6 +490,43 @@ func (rf *Raft) requestVote(server int, args *RequestVoteArgs) {
 	}
 }
 
+func (rf *Raft) digestAppendReponse(peer int, reply *AppendEntriesReply) {
+	// Do we still think we're the leader?
+	if rf.status != StatusLeader {
+		return
+	}
+	// We do. Is there reason to think we aren't?
+	if reply.Term > rf.currentTerm {
+		defer rf.persist()
+		rf.currentTerm = reply.Term
+		rf.status = StatusFollower
+		rf.votedFor = NoVote
+		rf.votesAcquired = 0
+		rf.nextIndex = make([]int, len(rf.peers))
+		rf.matchIndex = make([]int, len(rf.peers))
+		return
+	}
+	// According to this peer, we're still leader
+	// Is this peers log aligned with ours?
+	if !reply.Success {
+		if reply.BackupTerm > 0 {
+			var ind int
+			for ind = len(rf.log) - 1; ind > 0; ind-- {
+				if rf.log[ind].Term < reply.BackupTerm {
+					rf.nextIndex[peer] = min(ind+1, len(rf.log))
+					break
+				}
+			}
+		} else {
+			rf.nextIndex[peer] = max(min(reply.BackupIndex, len(rf.log)), 1)
+		}
+		return
+	}
+	// Update peer information
+	rf.nextIndex[peer] = max(min(reply.BackupIndex, len(rf.log)), 1)
+	rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+}
+
 func (rf *Raft) heartbeat() {
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -539,34 +555,7 @@ func (rf *Raft) heartbeat() {
 				}
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				// Do we still think we're the leader?
-				if rf.status != StatusLeader {
-					return
-				}
-				// We do. Is there reason to think we aren't?
-				if resp.Term > rf.currentTerm {
-					defer rf.persist()
-					rf.currentTerm = resp.Term
-					rf.status = StatusFollower
-					rf.votedFor = NoVote
-					rf.votesAcquired = 0
-					rf.nextIndex = make([]int, len(rf.peers))
-					rf.matchIndex = make([]int, len(rf.peers))
-					return
-				}
-				// According to this peer, we're still leader
-				// Is this peers log aligned with ours?
-				if !resp.Success {
-					if resp.BackupIndex > 1 {
-						rf.nextIndex[peer] = resp.BackupIndex
-					} else {
-						rf.nextIndex[peer] = 1
-					}
-					return
-				}
-				// Update peer information
-				rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
-				rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+				rf.digestAppendReponse(peer, resp)
 			}(i, args)
 			go rf.updateCommitIndex()
 		}
@@ -579,6 +568,12 @@ func (rf *Raft) heartbeat() {
 func (rf *Raft) updateCommitIndex() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	// Are we still leader, and has this leader appended a log this term?
+	if rf.status != StatusLeader || rf.log[len(rf.log)-1].Term < rf.currentTerm {
+		return
+	}
+
 	greaterThanCommit := 1 // Set at one because we know that we have the log
 	for {
 		for i := 0; i < len(rf.peers); i++ {
