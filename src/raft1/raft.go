@@ -198,12 +198,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == NoVote ||
 		rf.votedFor == args.CandidateId) &&
 		upToDateLog {
+		rf.electionTimeoutCh <- struct{}{}
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 	} else {
-		rf.votedFor = NoVote
 		reply.VoteGranted = false
 	}
+	reply.Term = rf.currentTerm
 }
 
 type AppendEntriesArgs struct {
@@ -251,19 +252,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Is there an entry at the provided index
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
-		reply.BackupIndex = len(rf.log) - 1
+		reply.BackupIndex = len(rf.log)
+		reply.BackupTerm = -1
 		return
 	}
 	// Matching term on PrevLogIndex?
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		var ind int
-		for ind = args.PrevLogIndex; ind > 0 && ind > rf.commitIndex; ind-- {
-			if rf.log[ind].Term < args.PrevLogTerm && rf.log[ind].Term < rf.log[args.PrevLogIndex].Term {
-				reply.BackupIndex = ind + 1
-				break
-			}
+		for ind = args.PrevLogIndex; ind > 0 && rf.log[ind-1].Term == rf.log[args.PrevLogIndex].Term; ind-- {
 		}
-		reply.BackupTerm = rf.log[min(reply.BackupIndex, args.PrevLogTerm)].Term
+		reply.BackupIndex = ind
+		reply.BackupTerm = rf.log[args.PrevLogIndex].Term
 		reply.Success = false
 		return
 	}
@@ -272,16 +271,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	var conflictInd int
 	for conflictInd < len(args.Entries) &&
 		conflictInd+args.PrevLogIndex+1 < len(rf.log) &&
-		rf.log[args.PrevLogIndex+conflictInd].Command == args.Entries[conflictInd].Command {
+		rf.log[args.PrevLogIndex+conflictInd+1].Term == args.Entries[conflictInd].Term {
 		conflictInd++
+	}
+	reply.Success = true
+	reply.BackupIndex = len(rf.log)
+	rf.commitIndex = min(args.CommitIndex, len(rf.log)-1)
+	if args.Entries == nil ||
+		conflictInd == len(args.Entries) {
+		return
 	}
 	rf.log = rf.log[:(args.PrevLogIndex+1)+conflictInd]
 	rf.log = append(rf.log, args.Entries[conflictInd:]...)
-	reply.Success = true
-	reply.BackupIndex = len(rf.log)
-	if args.CommitIndex > rf.commitIndex {
-		rf.commitIndex = min(args.CommitIndex, len(rf.log)-1)
-	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -368,7 +369,7 @@ func (rf *Raft) startAppendRequest(peer int, args *AppendEntriesArgs) {
 	if ok {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		rf.digestAppendReponse(peer, resp)
+		rf.digestAppendReponse(peer, args, resp)
 		go rf.updateCommitIndex()
 	}
 }
@@ -474,6 +475,8 @@ func (rf *Raft) requestVote(server int, args *RequestVoteArgs) {
 		rf.votesAcquired = 0
 		rf.votedFor = NoVote
 		return
+	} else if reply.Term != rf.currentTerm {
+		return
 	}
 	if reply.VoteGranted {
 		rf.votesAcquired++
@@ -490,9 +493,9 @@ func (rf *Raft) requestVote(server int, args *RequestVoteArgs) {
 	}
 }
 
-func (rf *Raft) digestAppendReponse(peer int, reply *AppendEntriesReply) {
+func (rf *Raft) digestAppendReponse(peer int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Do we still think we're the leader?
-	if rf.status != StatusLeader {
+	if rf.status != StatusLeader || args.Term != rf.currentTerm {
 		return
 	}
 	// We do. Is there reason to think we aren't?
@@ -509,22 +512,22 @@ func (rf *Raft) digestAppendReponse(peer int, reply *AppendEntriesReply) {
 	// According to this peer, we're still leader
 	// Is this peers log aligned with ours?
 	if !reply.Success {
-		if reply.BackupTerm > 0 {
-			var ind int
-			for ind = len(rf.log) - 1; ind > 0; ind-- {
-				if rf.log[ind].Term < reply.BackupTerm {
-					rf.nextIndex[peer] = min(ind+1, len(rf.log))
-					break
+		if reply.BackupTerm == -1 {
+			rf.nextIndex[peer] = max(min(reply.BackupIndex, len(rf.log)), 1)
+		} else {
+			for ind := len(rf.log) - 1; ind > 0; ind-- {
+				if rf.log[ind].Term == reply.BackupTerm {
+					rf.nextIndex[peer] = max(min(ind+1, len(rf.log)), 1)
+					return
 				}
 			}
-		} else {
 			rf.nextIndex[peer] = max(min(reply.BackupIndex, len(rf.log)), 1)
 		}
 		return
 	}
 	// Update peer information
-	rf.nextIndex[peer] = max(min(reply.BackupIndex, len(rf.log)), 1)
-	rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+	rf.matchIndex[peer] = max(rf.matchIndex[peer], args.PrevLogIndex+len(args.Entries))
+	rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 }
 
 func (rf *Raft) heartbeat() {
@@ -547,17 +550,7 @@ func (rf *Raft) heartbeat() {
 				Entries:      slices.Clone(rf.log[rf.nextIndex[i]:]),
 				CommitIndex:  rf.commitIndex,
 			}
-			go func(peer int, args *AppendEntriesArgs) {
-				resp := &AppendEntriesReply{}
-				ok := rf.peers[peer].Call("Raft.AppendEntries", args, resp)
-				if !ok {
-					return
-				}
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				rf.digestAppendReponse(peer, resp)
-			}(i, args)
-			go rf.updateCommitIndex()
+			go rf.startAppendRequest(i, args)
 		}
 		rf.mu.Unlock()
 
@@ -575,19 +568,22 @@ func (rf *Raft) updateCommitIndex() {
 	}
 
 	greaterThanCommit := 1 // Set at one because we know that we have the log
-	for {
+	for ind := rf.commitIndex + 1; ind < len(rf.log); ind++ {
+		if rf.log[ind].Term != rf.currentTerm {
+			continue
+		}
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
 			}
-			if rf.matchIndex[i] > rf.commitIndex {
+			if rf.matchIndex[i] >= ind {
 				greaterThanCommit++
 			}
 		}
 		if greaterThanCommit > len(rf.peers)/2 &&
 			rf.status == StatusLeader &&
-			rf.commitIndex+1 < len(rf.log) {
-			rf.commitIndex++
+			ind < len(rf.log) {
+			rf.commitIndex = ind
 			greaterThanCommit = 1
 		} else {
 			break
