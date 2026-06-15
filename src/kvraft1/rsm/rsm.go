@@ -2,24 +2,26 @@ package rsm
 
 import (
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
 	"6.5840/raft1"
 	"6.5840/raftapi"
 	"6.5840/tester1"
-
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
-
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Me   int
+	Term int
+	Id   int
+	Req  any
 }
-
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -41,6 +43,15 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+	reqId     int
+	pending   map[int]Result
+	commitInd int
+}
+
+type Result struct {
+	Term int
+	Id   int
+	Resp any
 }
 
 // servers[] contains the ports of the set of
@@ -64,17 +75,18 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		pending:      make(map[int]Result),
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	go rsm.reader()
 	return rsm
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
-
 
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
@@ -86,5 +98,86 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	rsm.mu.Lock()
+	term, isLeader := rsm.Raft().GetState()
+	if !isLeader {
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil
+	}
+
+	op := Op{
+		Term: term,
+		Me:   rsm.me,
+		Id:   rsm.reqId,
+		Req:  req,
+	}
+	rsm.reqId++
+
+	ind, term, isLeader := rsm.Raft().Start(op)
+	if !isLeader {
+		return rpc.ErrWrongLeader, nil
+	}
+	rsm.mu.Unlock()
+
+	var returnVal Result
+	var ok bool
+	var loopTerm int
+	for {
+		rsm.mu.Lock()
+		loopTerm, isLeader = rsm.Raft().GetState()
+		if !isLeader || term != loopTerm {
+			rsm.mu.Unlock()
+			return rpc.ErrWrongLeader, nil
+		}
+		if returnVal, ok = rsm.pending[ind]; !ok {
+			if ind <= rsm.commitInd {
+				rsm.mu.Unlock()
+				return rpc.ErrWrongLeader, nil
+			}
+			rsm.mu.Unlock()
+			time.Sleep(time.Millisecond * 100)
+			continue
+		}
+		rsm.commitInd = max(rsm.commitInd, ind)
+		if returnVal.Term != term {
+			rsm.mu.Unlock()
+			return rpc.ErrWrongLeader, nil
+		}
+		rsm.mu.Unlock()
+		if returnVal.Resp == nil {
+			return rpc.ErrWrongLeader, nil
+		}
+		return rpc.OK, returnVal.Resp
+	}
+}
+
+func (rsm *RSM) reader() {
+	for {
+		rsm.mu.Lock()
+		select {
+		case applyMsg := <-rsm.applyCh:
+			if !applyMsg.CommandValid {
+				rsm.mu.Unlock()
+				continue
+			}
+			op := applyMsg.Command.(Op)
+			resp := Result{
+				Id:   op.Id,
+				Term: op.Term,
+			}
+			switch op.Req.(type) {
+			case Dec:
+				resp.Resp = nil
+			case Null:
+				resp.Resp = NullRep{}
+			default:
+				resp.Resp = rsm.sm.DoOp(op.Req)
+			}
+			rsm.pending[applyMsg.CommandIndex] = resp
+			rsm.mu.Unlock()
+		default:
+			rsm.mu.Unlock()
+			time.Sleep(time.Millisecond * 100)
+		}
+	}
 }
