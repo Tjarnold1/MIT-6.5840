@@ -2,6 +2,7 @@ package rsm
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"6.5840/kvsrv1/rpc"
@@ -17,10 +18,9 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Me   int
-	Term int
-	Id   int
-	Req  any
+	Me  int
+	Id  int
+	Req any
 }
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
@@ -43,13 +43,16 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	reqId     int
-	pending   map[int]Result
-	commitInd int
+	reqId      int
+	pending    map[int]Result
+	commitInd  int
+	submitCond *sync.Cond
+	isLeader   bool
+	dead       int32
 }
 
 type Result struct {
-	Term int
+	Me   int
 	Id   int
 	Resp any
 }
@@ -77,10 +80,12 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		sm:           sm,
 		pending:      make(map[int]Result),
 	}
+	rsm.submitCond = sync.NewCond(&rsm.mu)
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
 	go rsm.reader()
+	go rsm.leaderWatcher()
 	return rsm
 }
 
@@ -99,85 +104,88 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 
 	// your code here
 	rsm.mu.Lock()
-	term, isLeader := rsm.Raft().GetState()
-	if !isLeader {
-		rsm.mu.Unlock()
-		return rpc.ErrWrongLeader, nil
-	}
-
 	op := Op{
-		Term: term,
-		Me:   rsm.me,
-		Id:   rsm.reqId,
-		Req:  req,
+		Me:  rsm.me,
+		Id:  rsm.reqId,
+		Req: req,
 	}
 	rsm.reqId++
-
-	ind, term, isLeader := rsm.Raft().Start(op)
+	rsm.mu.Unlock()
+	ind, _, isLeader := rsm.Raft().Start(op)
 	if !isLeader {
 		return rpc.ErrWrongLeader, nil
 	}
-	rsm.mu.Unlock()
+	//fmt.Printf("submitted op %+v with ind %d\n", op, ind)
 
-	var returnVal Result
-	var ok bool
-	var loopTerm int
+	rsm.mu.Lock()
+	rsm.isLeader = isLeader
 	for {
-		rsm.mu.Lock()
-		loopTerm, isLeader = rsm.Raft().GetState()
-		if !isLeader || term != loopTerm {
-			rsm.mu.Unlock()
-			return rpc.ErrWrongLeader, nil
-		}
-		if returnVal, ok = rsm.pending[ind]; !ok {
-			if ind <= rsm.commitInd {
-				rsm.mu.Unlock()
+		if returnVal, ok := rsm.pending[ind]; ok {
+			//fmt.Printf("recieved op %+v with val %+v\n", op, returnVal)
+			defer rsm.mu.Unlock()
+			if returnVal.Id != op.Id || returnVal.Me != op.Me {
 				return rpc.ErrWrongLeader, nil
 			}
-			rsm.mu.Unlock()
-			time.Sleep(time.Millisecond * 100)
-			continue
+			return rpc.OK, returnVal.Resp
 		}
-		rsm.commitInd = max(rsm.commitInd, ind)
-		if returnVal.Term != term {
+		//fmt.Printf("me: %d op: %d\n", rsm.me, op.Id)
+		//fmt.Printf("ind: %d commitInd: %d\n", ind, rsm.commitInd)
+		if ind < rsm.commitInd || !rsm.isLeader || rsm.killed() {
 			rsm.mu.Unlock()
 			return rpc.ErrWrongLeader, nil
 		}
-		rsm.mu.Unlock()
-		if returnVal.Resp == nil {
-			return rpc.ErrWrongLeader, nil
-		}
-		return rpc.OK, returnVal.Resp
+		rsm.submitCond.Wait()
 	}
 }
 
 func (rsm *RSM) reader() {
-	for {
-		rsm.mu.Lock()
+	for !rsm.killed() {
 		select {
 		case applyMsg := <-rsm.applyCh:
+			//fmt.Printf("apply msg %+v\n", applyMsg)
 			if !applyMsg.CommandValid {
-				rsm.mu.Unlock()
 				continue
 			}
 			op := applyMsg.Command.(Op)
 			resp := Result{
-				Id:   op.Id,
-				Term: op.Term,
+				Me: op.Me,
+				Id: op.Id,
 			}
 			switch op.Req.(type) {
 			case Dec:
 				resp.Resp = nil
 			case Null:
-				resp.Resp = NullRep{}
+				resp.Resp = &NullRep{}
 			default:
 				resp.Resp = rsm.sm.DoOp(op.Req)
 			}
+			rsm.mu.Lock()
+			rsm.commitInd = max(rsm.commitInd, applyMsg.CommandIndex)
 			rsm.pending[applyMsg.CommandIndex] = resp
 			rsm.mu.Unlock()
-		default:
-			rsm.mu.Unlock()
-			time.Sleep(time.Millisecond * 100)
+			rsm.submitCond.Broadcast()
 		}
 	}
+}
+
+func (rsm *RSM) leaderWatcher() {
+	for !rsm.killed() {
+		_, isLeader := rsm.rf.GetState()
+		rsm.mu.Lock()
+		rsm.isLeader = isLeader
+		rsm.mu.Unlock()
+		rsm.submitCond.Broadcast()
+		time.Sleep(time.Millisecond * 100)
+	}
+}
+
+func (rsm *RSM) Kill() {
+	rsm.mu.Lock()
+	atomic.StoreInt32(&rsm.dead, 1)
+	rsm.submitCond.Broadcast()
+	rsm.mu.Unlock()
+}
+
+func (rsm *RSM) killed() bool {
+	return atomic.LoadInt32(&rsm.dead) == 1
 }

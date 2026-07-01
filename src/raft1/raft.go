@@ -33,7 +33,7 @@ const (
 	NoVote          int    = -1
 )
 
-const grpcTimeout time.Duration = time.Duration(1000) * time.Millisecond
+const grpcTimeout time.Duration = time.Duration(500) * time.Millisecond
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -64,6 +64,7 @@ type Raft struct {
 
 	// My ideas for how things should work
 	electionTimeoutCh chan struct{}
+	applyCond         *sync.Cond
 
 	// Snapshot state
 	snapshotTerm  int
@@ -194,7 +195,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == NoVote ||
 		rf.votedFor == args.CandidateId) &&
 		upToDateLog {
-		rf.electionTimeoutCh <- struct{}{}
+		select {
+		case rf.electionTimeoutCh <- struct{}{}:
+		default:
+		}
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 	} else {
@@ -281,6 +285,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	reply.BackupIndex = len(rf.log) + rf.snapshotInd
 	rf.commitIndex = min(args.CommitIndex, len(rf.log)+rf.snapshotInd-1)
+	rf.applyCond.Signal()
 	if args.Entries == nil ||
 		conflictInd == len(args.Entries) {
 		return
@@ -476,6 +481,10 @@ func (rf *Raft) startInstallSnapshotRequest(peer int, args *InstallSnapshotArgs)
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	rf.status = StatusFollower
+	rf.mu.Unlock()
+	rf.applyCond.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -502,7 +511,7 @@ func (rf *Raft) ticker() {
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds. (Larger due to testing requirements)
-		ms := 300 + (rand.Int63() % 300)
+		ms := 100 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -513,7 +522,10 @@ func (rf *Raft) beginElection() {
 	defer rf.persist()
 	rf.currentTerm++
 	rf.status = StatusCandidate
-	rf.electionTimeoutCh <- struct{}{} // Reset election timer
+	select {
+	case rf.electionTimeoutCh <- struct{}{}: // Reset election timer
+	default:
+	}
 	rf.votedFor = rf.me
 	rf.votesAcquired = 1
 	req := &RequestVoteArgs{
@@ -656,7 +668,7 @@ func (rf *Raft) heartbeat() {
 		}
 		rf.mu.Unlock()
 
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -672,6 +684,7 @@ func (rf *Raft) updateCommitIndex() {
 	// Has a snapshot been applied?
 	if rf.commitIndex < rf.snapshotInd {
 		rf.commitIndex = rf.snapshotInd
+		rf.applyCond.Signal()
 	}
 
 	greaterThanCommit := 1 // Set at one because we know that we have the log
@@ -691,6 +704,7 @@ func (rf *Raft) updateCommitIndex() {
 			rf.status == StatusLeader &&
 			ind < len(rf.log)+rf.snapshotInd {
 			rf.commitIndex = ind
+			rf.applyCond.Signal()
 			greaterThanCommit = 1
 		} else {
 			break
@@ -702,6 +716,10 @@ func (rf *Raft) updateCommitIndex() {
 func (rf *Raft) applyWatcher(applyCh chan raftapi.ApplyMsg) {
 	for !rf.killed() {
 		rf.mu.Lock()
+		for !rf.applySnapshot && rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
+		}
+
 		messages := make([]raftapi.ApplyMsg, 0)
 		if rf.applySnapshot && rf.snapshotInd > rf.lastApplied {
 			messages = append(messages, raftapi.ApplyMsg{
@@ -728,8 +746,6 @@ func (rf *Raft) applyWatcher(applyCh chan raftapi.ApplyMsg) {
 		for _, msg := range messages {
 			applyCh <- msg
 		}
-
-		time.Sleep(300 * time.Millisecond)
 	}
 }
 
@@ -757,7 +773,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.votedFor = NoVote
 	rf.electionTimeoutCh = make(chan struct{}, 1)
-	rf.electionTimeoutCh <- struct{}{}
+	select {
+	case rf.electionTimeoutCh <- struct{}{}:
+	default:
+	}
+	rf.applyCond = sync.NewCond(&rf.mu)
 
 	rf.status = StatusFollower
 	rf.votesAcquired = 0
