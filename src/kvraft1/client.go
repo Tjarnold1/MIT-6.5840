@@ -23,7 +23,7 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 	return ck
 }
 
-// Get fetches the current value and version for a key.  It returns
+// Get fetches the current value and Version for a key.  It returns
 // ErrNoKey if the key does not exist. It keeps trying forever in the
 // face of all other errors.
 //
@@ -63,8 +63,8 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	return lastResp.Value, lastResp.Version, lastResp.Err
 }
 
-// Put updates key with value only if the version in the
-// request matches the version of the key at the server.  If the
+// Put updates key with value only if the Version in the
+// request matches the Version of the key at the server.  If the
 // versions numbers don't match, the server should return
 // ErrVersion.  If Put receives an ErrVersion on its first RPC, Put
 // should return ErrVersion, since the Put was definitely not
@@ -95,7 +95,6 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		go func() {
 			ch <- ck.clnt.Call(ck.servers[ck.leader], "KVServer.Put", &req, &resp)
 		}()
-		//fmt.Printf("put is spinning with req %+v\n", req)
 		var ok bool
 		select {
 		case ok = <-ch:
@@ -117,7 +116,6 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		if retries > 0 && resp.Err == rpc.ErrVersion {
 			return rpc.ErrMaybe
 		}
-		//fmt.Printf("put resp: %+v\n", resp)
 		break
 	}
 

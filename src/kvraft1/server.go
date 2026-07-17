@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"sync"
@@ -13,18 +14,13 @@ import (
 	"6.5840/tester1"
 )
 
-type Value struct {
-	val     string
-	version rpc.Tversion
-}
-
 type KVServer struct {
 	me   int
 	dead int32 // set by Kill()
 	rsm  *rsm.RSM
 
 	// Your definitions here.
-	values map[string]Value
+	values map[string]rsm.Value
 	mu     sync.Mutex
 }
 
@@ -46,11 +42,14 @@ func (kv *KVServer) DoOp(req any) any {
 			reply.Err = rpc.ErrNoKey
 			return reply
 		}
-		if value.version != args.Version {
+		if value.Version != args.Version {
 			reply.Err = rpc.ErrVersion
 			return reply
 		}
-		kv.values[args.Key] = Value{args.Value, args.Version + 1}
+		kv.values[args.Key] = rsm.Value{
+			Val:     args.Value,
+			Version: args.Version + 1,
+		}
 		return rpc.PutReply{
 			Err: rpc.OK,
 		}
@@ -63,8 +62,8 @@ func (kv *KVServer) DoOp(req any) any {
 			return reply
 		}
 		reply.Err = rpc.OK
-		reply.Value = value.val
-		reply.Version = value.version
+		reply.Value = value.Val
+		reply.Version = value.Version
 		return reply
 	default:
 		fmt.Printf("Unknown operation type %v\n", reflect.TypeOf(req))
@@ -75,11 +74,23 @@ func (kv *KVServer) DoOp(req any) any {
 
 func (kv *KVServer) Snapshot() []byte {
 	// Your code here
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(&kv.values) != nil {
+		panic("error encoding values")
+	}
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
 	// Your code here
+	r := bytes.NewReader(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&kv.values) != nil {
+		panic("fail restoring server values")
+	}
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -140,7 +151,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	kv := &KVServer{me: me}
 
 	// You may need initialization code here.
-	kv.values = make(map[string]Value)
+	kv.values = make(map[string]rsm.Value)
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	return []tester.IService{kv, kv.rsm.Raft()}
 }

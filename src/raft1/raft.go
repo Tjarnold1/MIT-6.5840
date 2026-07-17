@@ -8,7 +8,6 @@ package raft
 
 import (
 	"bytes"
-	"log"
 	"slices"
 
 	//	"bytes"
@@ -100,6 +99,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.snapshotInd)
+	e.Encode(rf.snapshotTerm)
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, rf.snapshot)
 }
@@ -114,6 +115,8 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []LogEntry
+	var snapInd int
+	var snapTerm int
 	if err := d.Decode(&currentTerm); err != nil {
 		panic("error decoding current term")
 	}
@@ -123,9 +126,18 @@ func (rf *Raft) readPersist(data []byte) {
 	if err := d.Decode(&log); err != nil {
 		panic("error decoding log")
 	}
+	if err := d.Decode(&snapInd); err != nil {
+		panic("error decoding snap ind")
+	}
+	if err := d.Decode(&snapTerm); err != nil {
+		panic("error decoding snap term")
+	}
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
 	rf.log = slices.Clone(log)
+	rf.commitIndex = snapInd
+	rf.snapshotInd = snapInd
+	rf.snapshotTerm = snapTerm
 }
 
 // how many bytes in Raft's persisted log?
@@ -147,8 +159,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 	defer rf.persist()
 	rf.snapshot = snapshot
-	rf.snapshotTerm = rf.log[index-rf.snapshotInd].Term
-	rf.log = rf.log[(index - rf.snapshotInd):]
+	if len(rf.log) == 1 {
+		rf.snapshotTerm = rf.log[0].Term
+	} else {
+		rf.snapshotTerm = rf.log[index-rf.snapshotInd].Term
+		rf.log = rf.log[(index - rf.snapshotInd):]
+	}
 	rf.snapshotInd = index
 }
 
@@ -309,7 +325,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.currentTerm || args.LastLogIndex < rf.snapshotInd {
 		return
 	}
 	if args.Term >= rf.currentTerm {
@@ -328,12 +344,17 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	// Initialize log, and add snapshot entry
-	rf.log = []LogEntry{
+	tempLog := []LogEntry{
 		{
 			Term:    args.LastLogTerm,
 			Command: args.LastLogIndex,
 		},
 	}
+	offSet := args.LastLogIndex - rf.snapshotInd + 1
+	if offSet >= 0 && offSet < len(rf.log) {
+		tempLog = append(tempLog, rf.log[offSet:]...)
+	}
+	rf.log = tempLog
 	rf.votedFor = args.LeaderId
 	rf.currentTerm = args.Term
 	rf.snapshot = args.Data
@@ -341,6 +362,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.snapshotTerm = args.LastLogTerm
 	rf.applySnapshot = true
 	reply.Term = rf.currentTerm
+	rf.applyCond.Broadcast()
 	go rf.updateCommitIndex()
 }
 
@@ -787,23 +809,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.applyWatcher(applyCh)
 
 	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 	rf.snapshot = persister.ReadSnapshot()
 	if rf.snapshot != nil && len(rf.snapshot) > 0 {
-		r := bytes.NewBuffer(rf.snapshot)
-		d := labgob.NewDecoder(r)
-		var lastIncludedIndex int
-		var xlog []any
-		if d.Decode(&lastIncludedIndex) != nil ||
-			d.Decode(&xlog) != nil {
-			text := "failed to decode snapshot"
-			tester.AnnotateCheckerFailureBeforeExit(text, text)
-			log.Fatalf("snapshot decode error")
-			panic("snapshot Decode() error")
-		}
-		rf.snapshotInd = lastIncludedIndex
 		rf.applySnapshot = true
+		rf.applyCond.Broadcast()
 	}
-	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()

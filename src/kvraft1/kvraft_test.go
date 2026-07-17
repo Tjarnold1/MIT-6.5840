@@ -71,6 +71,7 @@ func (ts *Test) GenericTest() {
 			tester.SetAnnotationFinalized()
 		}
 
+		//fmt.Println(ts.Oplog.Read())
 		ts.CheckPorcupine()
 
 		if ts.partitions {
@@ -236,11 +237,11 @@ func TestOnePartition4B(t *testing.T) {
 
 	select {
 	case ver := <-done0:
-		err := fmt.Sprintf("Put in minority completed with version = %v", ver)
+		err := fmt.Sprintf("Put in minority completed with Version = %v", ver)
 		tester.AnnotateCheckerFailure(err, err)
 		t.Fatalf(err)
 	case ver := <-done1:
-		err := fmt.Sprintf("Get in minority completed with version = %v", ver)
+		err := fmt.Sprintf("Get in minority completed with Version = %v", ver)
 		tester.AnnotateCheckerFailure(err, err)
 		t.Fatalf(err)
 	case <-time.After(time.Second):
@@ -248,8 +249,11 @@ func TestOnePartition4B(t *testing.T) {
 	tester.AnnotateCheckerSuccess(
 		"commands to minority partition not committed after 1 second", "not committed")
 
+	fmt.Println("first checkget")
 	ts.CheckGet(ckp1, "1", "14", ver1)
+	fmt.Println("putatleastonce")
 	ver2 := ts.PutAtLeastOnce(ckp1, "1", "16", ver1, -1)
+	fmt.Println("second checkget")
 	ts.CheckGet(ckp1, "1", "16", ver2)
 
 	ts.End()

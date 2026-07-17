@@ -46,7 +46,7 @@ type IClerkMaker interface {
 type Test struct {
 	*tester.Config
 	t          *testing.T
-	oplog      *OpLog
+	Oplog      *OpLog
 	mck        IClerkMaker
 	randomkeys bool
 }
@@ -56,7 +56,7 @@ func MakeTest(t *testing.T, cfg *tester.Config, randomkeys bool, mck IClerkMaker
 		Config:     cfg,
 		t:          t,
 		mck:        mck,
-		oplog:      &OpLog{},
+		Oplog:      &OpLog{},
 		randomkeys: randomkeys,
 	}
 	return ts
@@ -169,7 +169,7 @@ func (ts *Test) SpawnClientsAndWait(nclnt int, t time.Duration, fn Fclnt) []Clnt
 }
 
 func (ts *Test) GetJson(ck IKVClerk, key string, me int, v any) rpc.Tversion {
-	if val, ver, err := Get(ts.Config, ck, key, ts.oplog, me); err == rpc.OK {
+	if val, ver, err := Get(ts.Config, ck, key, ts.Oplog, me); err == rpc.OK {
 		if err := json.Unmarshal([]byte(val), v); err != nil {
 			ts.Fatalf("Unmarshal err %v", ver)
 		}
@@ -185,7 +185,7 @@ func (ts *Test) PutJson(ck IKVClerk, key string, v any, ver rpc.Tversion, me int
 	if err != nil {
 		ts.Fatalf("%d: marshal %v", me, err)
 	}
-	return Put(ts.Config, ck, key, string(b), ver, ts.oplog, me)
+	return Put(ts.Config, ck, key, string(b), ver, ts.Oplog, me)
 }
 
 func (ts *Test) PutAtLeastOnceJson(ck IKVClerk, key string, value any, ver rpc.Tversion, me int) rpc.Tversion {

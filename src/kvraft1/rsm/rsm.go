@@ -23,6 +23,11 @@ type Op struct {
 	Req any
 }
 
+type Value struct {
+	Val     string
+	Version rpc.Tversion
+}
+
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
 // interface allows the rsm package to interact with the server for
@@ -43,12 +48,13 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	reqId      int
-	pending    map[int]Result
-	commitInd  int
-	submitCond *sync.Cond
-	isLeader   bool
-	dead       int32
+	reqId       int
+	pending     map[int]Result
+	commitInd   int
+	snapshotInd int
+	submitCond  *sync.Cond
+	isLeader    bool
+	dead        int32
 }
 
 type Result struct {
@@ -84,6 +90,10 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	snapshot := persister.ReadSnapshot()
+	if snapshot != nil && len(snapshot) > 0 {
+		rsm.sm.Restore(snapshot)
+	}
 	go rsm.reader()
 	go rsm.leaderWatcher()
 	return rsm
@@ -115,21 +125,17 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	if !isLeader {
 		return rpc.ErrWrongLeader, nil
 	}
-	//fmt.Printf("submitted op %+v with ind %d\n", op, ind)
 
 	rsm.mu.Lock()
 	rsm.isLeader = isLeader
 	for {
 		if returnVal, ok := rsm.pending[ind]; ok {
-			//fmt.Printf("recieved op %+v with val %+v\n", op, returnVal)
 			defer rsm.mu.Unlock()
 			if returnVal.Id != op.Id || returnVal.Me != op.Me {
 				return rpc.ErrWrongLeader, nil
 			}
 			return rpc.OK, returnVal.Resp
 		}
-		//fmt.Printf("me: %d op: %d\n", rsm.me, op.Id)
-		//fmt.Printf("ind: %d commitInd: %d\n", ind, rsm.commitInd)
 		if ind < rsm.commitInd || !rsm.isLeader || rsm.killed() {
 			rsm.mu.Unlock()
 			return rpc.ErrWrongLeader, nil
@@ -142,26 +148,39 @@ func (rsm *RSM) reader() {
 	for !rsm.killed() {
 		select {
 		case applyMsg := <-rsm.applyCh:
-			//fmt.Printf("apply msg %+v\n", applyMsg)
-			if !applyMsg.CommandValid {
-				continue
+			if applyMsg.SnapshotValid {
+				rsm.mu.Lock()
+				rsm.commitInd = max(rsm.commitInd, applyMsg.SnapshotIndex)
+				rsm.sm.Restore(applyMsg.Snapshot)
+				//rsm.snapshot(applyMsg.SnapshotIndex)
+			} else if applyMsg.CommandValid {
+				if applyMsg.CommandIndex <= rsm.commitInd {
+					continue
+				}
+				op := applyMsg.Command.(Op)
+				resp := Result{
+					Me: op.Me,
+					Id: op.Id,
+				}
+				switch op.Req.(type) {
+				case Dec:
+					resp.Resp = nil
+				case Null:
+					resp.Resp = &NullRep{}
+				default:
+					resp.Resp = rsm.sm.DoOp(op.Req)
+				}
+				rsm.mu.Lock()
+				rsm.commitInd = max(rsm.commitInd, applyMsg.CommandIndex)
+				rsm.pending[applyMsg.CommandIndex] = resp
+				currentSize := rsm.Raft().PersistBytes()
+				if currentSize >= rsm.maxraftstate {
+					rsm.snapshot(rsm.commitInd)
+				}
+			} else {
+				panic("Not sure how you've done this")
 			}
-			op := applyMsg.Command.(Op)
-			resp := Result{
-				Me: op.Me,
-				Id: op.Id,
-			}
-			switch op.Req.(type) {
-			case Dec:
-				resp.Resp = nil
-			case Null:
-				resp.Resp = &NullRep{}
-			default:
-				resp.Resp = rsm.sm.DoOp(op.Req)
-			}
-			rsm.mu.Lock()
-			rsm.commitInd = max(rsm.commitInd, applyMsg.CommandIndex)
-			rsm.pending[applyMsg.CommandIndex] = resp
+			// Not sure if I want the snapshot before I unlock...
 			rsm.mu.Unlock()
 			rsm.submitCond.Broadcast()
 		}
@@ -188,4 +207,9 @@ func (rsm *RSM) Kill() {
 
 func (rsm *RSM) killed() bool {
 	return atomic.LoadInt32(&rsm.dead) == 1
+}
+
+func (rsm *RSM) snapshot(currCommitInd int) {
+	serverState := rsm.sm.Snapshot()
+	rsm.Raft().Snapshot(currCommitInd, serverState)
 }

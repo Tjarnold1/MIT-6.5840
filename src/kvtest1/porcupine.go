@@ -94,7 +94,7 @@ func checkPorcupine(t *testing.T, opLog *OpLog, nsec time.Duration) {
 			// Save the vis file in a temporary file.
 			file, err = os.CreateTemp("", "porcupine-*.html")
 		} else {
-			file, err = os.OpenFile(fpath, os.O_RDWR | os.O_CREATE | os.O_TRUNC, 0644)
+			file, err = os.OpenFile(fpath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 		}
 		if err != nil {
 			fmt.Printf("info: failed to open visualization file %s (%v)\n", fpath, err)
@@ -122,7 +122,7 @@ func checkPorcupine(t *testing.T, opLog *OpLog, nsec time.Duration) {
 			// Save the vis file in a temporary file.
 			file, err = os.CreateTemp("", "porcupine-*.html")
 		} else {
-			file, err = os.OpenFile(fpath, os.O_RDWR | os.O_CREATE | os.O_TRUNC, 0644)
+			file, err = os.OpenFile(fpath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 		}
 		if err != nil {
 			fmt.Printf("info: failed to open visualization file %s (%v)\n", fpath, err)
@@ -145,8 +145,8 @@ func (ts *Test) Get(ck IKVClerk, key string, cli int) (string, rpc.Tversion, rpc
 	val, ver, err := ck.Get(key)
 	end := int64(time.Since(t0))
 	ts.Op()
-	if ts.oplog != nil {
-		ts.oplog.Append(porcupine.Operation{
+	if ts.Oplog != nil {
+		ts.Oplog.Append(porcupine.Operation{
 			Input:    models.KvInput{Op: 0, Key: key},
 			Output:   models.KvOutput{Value: val, Version: uint64(ver), Err: string(err)},
 			Call:     start,
@@ -163,8 +163,8 @@ func (ts *Test) Put(ck IKVClerk, key string, value string, version rpc.Tversion,
 	err := ck.Put(key, value, version)
 	end := int64(time.Since(t0))
 	ts.Op()
-	if ts.oplog != nil {
-		ts.oplog.Append(porcupine.Operation{
+	if ts.Oplog != nil {
+		ts.Oplog.Append(porcupine.Operation{
 			Input:    models.KvInput{Op: 1, Key: key, Value: value, Version: uint64(version)},
 			Output:   models.KvOutput{Err: string(err)},
 			Call:     start,
@@ -183,5 +183,5 @@ func (ts *Test) CheckPorcupineT(nsec time.Duration) {
 	// tester.RetrieveAnnotations() also clears the accumulated annotations so
 	// that the vis file containing client operations (generated here) won't be
 	// overridden by that without client operations (generated at cleanup time).
-	checkPorcupine(ts.t, ts.oplog, nsec)
+	checkPorcupine(ts.t, ts.Oplog, nsec)
 }
